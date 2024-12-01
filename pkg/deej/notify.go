@@ -11,53 +11,55 @@ import (
 	"github.com/omriharel/deej/pkg/deej/util"
 )
 
-// Notifier provides generic notification sending
+// Notifier provides a generic interface for sending notifications.
 type Notifier interface {
 	Notify(title string, message string)
 }
 
-// ToastNotifier provides toast notifications for Windows
+// ToastNotifier handles sending toast notifications on Windows systems.
 type ToastNotifier struct {
 	logger *zap.SugaredLogger
 }
 
-// NewToastNotifier creates a new ToastNotifier
+// NewToastNotifier creates a new instance of ToastNotifier.
 func NewToastNotifier(logger *zap.SugaredLogger) (*ToastNotifier, error) {
 	logger = logger.Named("notifier")
-	tn := &ToastNotifier{logger: logger}
-
 	logger.Debug("Created toast notifier instance")
 
-	return tn, nil
+	return &ToastNotifier{logger: logger}, nil
 }
 
-// Notify sends a toast notification (or falls back to other types of notification for older Windows versions)
-func (tn *ToastNotifier) Notify(title string, message string) {
-
-	// we need to unpack deej.ico somewhere to remain portable. we already have it as bytes so it should be fine
+// Notify sends a toast notification. If the notification icon is missing, it creates it dynamically.
+func (tn *ToastNotifier) Notify(title, message string) {
 	appIconPath := filepath.Join(os.TempDir(), "deej.ico")
 
-	if !util.FileExists(appIconPath) {
-		tn.logger.Debugw("Deej icon file missing, creating", "path", appIconPath)
-
-		f, err := os.Create(appIconPath)
-		if err != nil {
-			tn.logger.Errorw("Failed to create toast notification icon", "error", err)
-		}
-
-		if _, err = f.Write(icon.DeejLogo); err != nil {
-			tn.logger.Errorw("Failed to write toast notification icon", "error", err)
-		}
-
-		if err = f.Close(); err != nil {
-			tn.logger.Errorw("Failed to close toast notification icon", "error", err)
-		}
+	// Ensure the icon file exists.
+	if err := tn.ensureIconFile(appIconPath); err != nil {
+		tn.logger.Errorw("Failed to prepare toast notification icon", "error", err)
+		return
 	}
 
 	tn.logger.Infow("Sending toast notification", "title", title, "message", message)
 
-	// send the actual notification
+	// Send the notification.
 	if err := beeep.Notify(title, message, appIconPath); err != nil {
 		tn.logger.Errorw("Failed to send toast notification", "error", err)
 	}
+}
+
+// ensureIconFile checks if the icon file exists, and creates it if necessary.
+func (tn *ToastNotifier) ensureIconFile(path string) error {
+	if util.FileExists(path) {
+		return nil
+	}
+
+	tn.logger.Debugw("Deej icon file missing, creating", "path", path)
+
+	// Create the icon file and write the content.
+	if err := os.WriteFile(path, icon.DeejLogo, 0644); err != nil {
+		return err
+	}
+
+	tn.logger.Debugw("Successfully created toast notification icon", "path", path)
+	return nil
 }

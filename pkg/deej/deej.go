@@ -1,5 +1,5 @@
 // Package deej provides a machine-side client that pairs with an Arduino
-// chip to form a tactile, physical volume control system/
+// chip to form a tactile, physical volume control system.
 package deej
 
 import (
@@ -13,100 +13,91 @@ import (
 )
 
 const (
-
-	// when this is set to anything, deej won't use a tray icon
-	envNoTray = "DEEJ_NO_TRAY_ICON"
+	// EnvNoTray disables the tray icon when set.
+	EnvNoTray = "DEEJ_NO_TRAY_ICON"
 )
 
-// Deej is the main entity managing access to all sub-components
+// Deej manages the main application components.
 type Deej struct {
-	logger   *zap.SugaredLogger
-	notifier Notifier
-	config   *CanonicalConfig
-	serial   *SerialIO
-	sessions *sessionMap
-
+	logger      *zap.SugaredLogger
+	notifier    Notifier
+	config      *CanonicalConfig
+	serial      *SerialIO
+	sessions    *sessionMap
 	stopChannel chan bool
 	version     string
 	verbose     bool
 }
 
-// NewDeej creates a Deej instance
+// NewDeej creates a new Deej instance.
 func NewDeej(logger *zap.SugaredLogger, verbose bool) (*Deej, error) {
 	logger = logger.Named("deej")
 
 	notifier, err := NewToastNotifier(logger)
 	if err != nil {
-		logger.Errorw("Failed to create ToastNotifier", "error", err)
-		return nil, fmt.Errorf("create new ToastNotifier: %w", err)
+		logger.Errorw("Failed to create notifier", "error", err)
+		return nil, fmt.Errorf("failed to create notifier: %w", err)
 	}
 
 	config, err := NewConfig(logger, notifier)
 	if err != nil {
-		logger.Errorw("Failed to create Config", "error", err)
-		return nil, fmt.Errorf("create new Config: %w", err)
+		logger.Errorw("Failed to create configuration", "error", err)
+		return nil, fmt.Errorf("failed to create configuration: %w", err)
+	}
+
+	serial, err := NewSerialIO(nil, logger)
+	if err != nil {
+		logger.Errorw("Failed to initialize serial communication", "error", err)
+		return nil, fmt.Errorf("failed to initialize serial communication: %w", err)
+	}
+
+	sessionFinder, err := newSessionFinder(logger)
+	if err != nil {
+		logger.Errorw("Failed to initialize session finder", "error", err)
+		return nil, fmt.Errorf("failed to initialize session finder: %w", err)
+	}
+
+	sessions, err := newSessionMap(nil, logger, sessionFinder)
+	if err != nil {
+		logger.Errorw("Failed to initialize session map", "error", err)
+		return nil, fmt.Errorf("failed to initialize session map: %w", err)
 	}
 
 	d := &Deej{
 		logger:      logger,
 		notifier:    notifier,
 		config:      config,
+		serial:      serial,
+		sessions:    sessions,
 		stopChannel: make(chan bool),
 		verbose:     verbose,
 	}
 
-	serial, err := NewSerialIO(d, logger)
-	if err != nil {
-		logger.Errorw("Failed to create SerialIO", "error", err)
-		return nil, fmt.Errorf("create new SerialIO: %w", err)
-	}
+	serial.SetParent(d)
+	sessions.SetParent(d)
 
-	d.serial = serial
-
-	sessionFinder, err := newSessionFinder(logger)
-	if err != nil {
-		logger.Errorw("Failed to create SessionFinder", "error", err)
-		return nil, fmt.Errorf("create new SessionFinder: %w", err)
-	}
-
-	sessions, err := newSessionMap(d, logger, sessionFinder)
-	if err != nil {
-		logger.Errorw("Failed to create sessionMap", "error", err)
-		return nil, fmt.Errorf("create new sessionMap: %w", err)
-	}
-
-	d.sessions = sessions
-
-	logger.Debug("Created deej instance")
-
+	logger.Debug("Deej instance created successfully")
 	return d, nil
 }
 
-// Initialize sets up components and starts to run in the background
+// Initialize prepares components and starts running the application.
 func (d *Deej) Initialize() error {
-	d.logger.Debug("Initializing")
+	d.logger.Debug("Initializing deej")
 
-	// load the config for the first time
 	if err := d.config.Load(); err != nil {
-		d.logger.Errorw("Failed to load config during initialization", "error", err)
-		return fmt.Errorf("load config during init: %w", err)
+		d.logger.Errorw("Failed to load configuration", "error", err)
+		return fmt.Errorf("failed to load configuration: %w", err)
 	}
 
-	// initialize the session map
 	if err := d.sessions.initialize(); err != nil {
 		d.logger.Errorw("Failed to initialize session map", "error", err)
-		return fmt.Errorf("init session map: %w", err)
+		return fmt.Errorf("failed to initialize session map: %w", err)
 	}
 
-	// decide whether to run with/without tray
-	if _, noTraySet := os.LookupEnv(envNoTray); noTraySet {
-
-		d.logger.Debugw("Running without tray icon", "reason", "envvar set")
-
-		// run in main thread while waiting on ctrl+C
+	if os.Getenv(EnvNoTray) != "" {
+		d.logger.Debug("Running without tray icon")
 		d.setupInterruptHandler()
 		d.run()
-
 	} else {
 		d.setupInterruptHandler()
 		d.initializeTray(d.run)
@@ -115,12 +106,12 @@ func (d *Deej) Initialize() error {
 	return nil
 }
 
-// SetVersion causes deej to add a version string to its tray menu if called before Initialize
+// SetVersion sets the application version for display in the tray menu.
 func (d *Deej) SetVersion(version string) {
 	d.version = version
 }
 
-// Verbose returns a boolean indicating whether deej is running in verbose mode
+// Verbose indicates whether the application runs in verbose mode.
 func (d *Deej) Verbose() bool {
 	return d.verbose
 }
@@ -130,7 +121,7 @@ func (d *Deej) setupInterruptHandler() {
 
 	go func() {
 		signal := <-interruptChannel
-		d.logger.Debugw("Interrupted", "signal", signal)
+		d.logger.Debugw("Interrupt received", "signal", signal)
 		d.signalStop()
 	}()
 }
@@ -138,71 +129,58 @@ func (d *Deej) setupInterruptHandler() {
 func (d *Deej) run() {
 	d.logger.Info("Run loop starting")
 
-	// watch the config file for changes
 	go d.config.WatchConfigFileChanges()
 
-	// connect to the arduino for the first time
 	go func() {
 		if err := d.serial.Start(); err != nil {
-			d.logger.Warnw("Failed to start first-time serial connection", "error", err)
-
-			// If the port is busy, that's because something else is connected - notify and quit
-			if errors.Is(err, os.ErrPermission) {
-				d.logger.Warnw("Serial port seems busy, notifying user and closing",
-					"comPort", d.config.ConnectionInfo.COMPort)
-
-				d.notifier.Notify(fmt.Sprintf("Can't connect to %s!", d.config.ConnectionInfo.COMPort),
-					"This serial port is busy, make sure to close any serial monitor or other deej instance.")
-
-				d.signalStop()
-
-				// also notify if the COM port they gave isn't found, maybe their config is wrong
-			} else if errors.Is(err, os.ErrNotExist) {
-				d.logger.Warnw("Provided COM port seems wrong, notifying user and closing",
-					"comPort", d.config.ConnectionInfo.COMPort)
-
-				d.notifier.Notify(fmt.Sprintf("Can't connect to %s!", d.config.ConnectionInfo.COMPort),
-					"This serial port doesn't exist, check your configuration and make sure it's set correctly.")
-
-				d.signalStop()
-			}
+			d.handleSerialError(err)
 		}
 	}()
 
-	// wait until stopped (gracefully)
 	<-d.stopChannel
-	d.logger.Debug("Stop channel signaled, terminating")
+	d.logger.Debug("Stop signal received")
 
 	if err := d.stop(); err != nil {
-		d.logger.Warnw("Failed to stop deej", "error", err)
+		d.logger.Warnw("Error during shutdown", "error", err)
 		os.Exit(1)
-	} else {
-		// exit with 0
-		os.Exit(0)
 	}
+
+	os.Exit(0)
+}
+
+func (d *Deej) handleSerialError(err error) {
+	switch {
+	case errors.Is(err, os.ErrPermission):
+		d.logger.Warnw("Serial port busy", "comPort", d.config.ConnectionInfo.COMPort)
+		d.notifier.Notify("Serial port busy!",
+			"Close other applications using the port and try again.")
+	case errors.Is(err, os.ErrNotExist):
+		d.logger.Warnw("Invalid serial port configuration", "comPort", d.config.ConnectionInfo.COMPort)
+		d.notifier.Notify("Invalid serial port!",
+			"Ensure the correct port is set in the configuration.")
+	default:
+		d.logger.Warnw("Unknown error during serial start", "error", err)
+	}
+	d.signalStop()
 }
 
 func (d *Deej) signalStop() {
-	d.logger.Debug("Signalling stop channel")
+	d.logger.Debug("Sending stop signal")
 	d.stopChannel <- true
 }
 
 func (d *Deej) stop() error {
-	d.logger.Info("Stopping")
+	d.logger.Info("Shutting down deej")
 
 	d.config.StopWatchingConfigFile()
 	d.serial.Stop()
 
-	// release the session map
 	if err := d.sessions.release(); err != nil {
 		d.logger.Errorw("Failed to release session map", "error", err)
-		return fmt.Errorf("release session map: %w", err)
+		return fmt.Errorf("failed to release session map: %w", err)
 	}
 
 	d.stopTray()
-
-	// attempt to sync on exit - this won't necessarily work but can't harm
 	d.logger.Sync()
-
 	return nil
 }

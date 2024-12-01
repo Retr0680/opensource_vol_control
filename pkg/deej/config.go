@@ -13,28 +13,27 @@ import (
 	"github.com/omriharel/deej/pkg/deej/util"
 )
 
-// CanonicalConfig provides application-wide access to configuration fields,
-// as well as loading/file watching logic for deej's configuration file
+// CanonicalConfig provides centralized access to configuration fields
 type CanonicalConfig struct {
-	SliderMapping *sliderMap
-
-	ConnectionInfo struct {
-		COMPort  string
-		BaudRate int
-	}
-
-	InvertSliders bool
-
+	SliderMapping       *sliderMap
+	ConnectionInfo      ConnectionInfo
+	InvertSliders       bool
 	NoiseReductionLevel string
 
 	logger             *zap.SugaredLogger
 	notifier           Notifier
-	stopWatcherChannel chan bool
+	stopWatcherChannel chan struct{}
 
 	reloadConsumers []chan bool
 
 	userConfig     *viper.Viper
 	internalConfig *viper.Viper
+}
+
+// ConnectionInfo groups serial port settings
+type ConnectionInfo struct {
+	COMPort  string
+	BaudRate int
 }
 
 const (
@@ -43,211 +42,139 @@ const (
 
 	userConfigName     = "config"
 	internalConfigName = "preferences"
+	userConfigPath     = "."
 
-	userConfigPath = "."
+	configType              = "yaml"
+	configKeySliderMapping  = "slider_mapping"
+	configKeyInvertSliders  = "invert_sliders"
+	configKeyCOMPort        = "com_port"
+	configKeyBaudRate       = "baud_rate"
+	configKeyNoiseReduction = "noise_reduction"
 
-	configType = "yaml"
-
-	configKeySliderMapping       = "slider_mapping"
-	configKeyInvertSliders       = "invert_sliders"
-	configKeyCOMPort             = "com_port"
-	configKeyBaudRate            = "baud_rate"
-	configKeyNoiseReductionLevel = "noise_reduction"
-
-	defaultCOMPort  = "COM4"
+	defaultCOMPort  = "COM7"
 	defaultBaudRate = 9600
 )
 
-// has to be defined as a non-constant because we're using path.Join
 var internalConfigPath = path.Join(".", logDirectory)
 
+// Default slider mapping when no configuration is provided
 var defaultSliderMapping = func() *sliderMap {
-	emptyMap := newSliderMap()
-	emptyMap.set(0, []string{masterSessionName})
-
-	return emptyMap
+	mapping := newSliderMap()
+	mapping.set(0, []string{masterSessionName})
+	return mapping
 }()
 
-// NewConfig creates a config instance for the deej object and sets up viper instances for deej's config files
+// NewConfig initializes the configuration manager
 func NewConfig(logger *zap.SugaredLogger, notifier Notifier) (*CanonicalConfig, error) {
 	logger = logger.Named("config")
 
 	cc := &CanonicalConfig{
 		logger:             logger,
 		notifier:           notifier,
-		reloadConsumers:    []chan bool{},
-		stopWatcherChannel: make(chan bool),
+		reloadConsumers:    make([]chan bool, 0),
+		stopWatcherChannel: make(chan struct{}),
 	}
 
-	// distinguish between the user-provided config (config.yaml) and the internal config (logs/preferences.yaml)
-	userConfig := viper.New()
-	userConfig.SetConfigName(userConfigName)
-	userConfig.SetConfigType(configType)
-	userConfig.AddConfigPath(userConfigPath)
-
-	userConfig.SetDefault(configKeySliderMapping, map[string][]string{})
-	userConfig.SetDefault(configKeyInvertSliders, false)
-	userConfig.SetDefault(configKeyCOMPort, defaultCOMPort)
-	userConfig.SetDefault(configKeyBaudRate, defaultBaudRate)
-
-	internalConfig := viper.New()
-	internalConfig.SetConfigName(internalConfigName)
-	internalConfig.SetConfigType(configType)
-	internalConfig.AddConfigPath(internalConfigPath)
-
-	cc.userConfig = userConfig
-	cc.internalConfig = internalConfig
-
-	logger.Debug("Created config instance")
+	cc.initializeViperInstances()
+	logger.Debug("Created configuration instance")
 
 	return cc, nil
 }
 
-// Load reads deej's config files from disk and tries to parse them
+// initializeViperInstances sets up user and internal config
+func (cc *CanonicalConfig) initializeViperInstances() {
+	cc.userConfig = initializeViper(userConfigName, userConfigPath, map[string]interface{}{
+		configKeySliderMapping:  map[string][]string{},
+		configKeyInvertSliders:  false,
+		configKeyCOMPort:        defaultCOMPort,
+		configKeyBaudRate:       defaultBaudRate,
+	})
+	cc.internalConfig = initializeViper(internalConfigName, internalConfigPath, nil)
+}
+
+// initializeViper creates and configures a Viper instance
+func initializeViper(name, path string, defaults map[string]interface{}) *viper.Viper {
+	config := viper.New()
+	config.SetConfigName(name)
+	config.SetConfigType(configType)
+	config.AddConfigPath(path)
+
+	for key, value := range defaults {
+		config.SetDefault(key, value)
+	}
+
+	return config
+}
+
+// Load reads and validates configuration files
 func (cc *CanonicalConfig) Load() error {
-	cc.logger.Debugw("Loading config", "path", userConfigFilepath)
+	cc.logger.Debugw("Loading user configuration", "path", userConfigFilepath)
 
-	// make sure it exists
+	if err := cc.readUserConfig(); err != nil {
+		return err
+	}
+	if err := cc.readInternalConfig(); err != nil {
+		cc.logger.Debugw("Skipping optional internal config", "error", err)
+	}
+
+	return cc.populateFromVipers()
+}
+
+// readUserConfig loads the user-provided configuration
+func (cc *CanonicalConfig) readUserConfig() error {
 	if !util.FileExists(userConfigFilepath) {
-		cc.logger.Warnw("Config file not found", "path", userConfigFilepath)
-		cc.notifier.Notify("Can't find configuration!",
-			fmt.Sprintf("%s must be in the same directory as deej. Please re-launch", userConfigFilepath))
-
-		return fmt.Errorf("config file doesn't exist: %s", userConfigFilepath)
+		cc.handleMissingConfig()
+		return fmt.Errorf("config file not found: %s", userConfigFilepath)
 	}
 
-	// load the user config
 	if err := cc.userConfig.ReadInConfig(); err != nil {
-		cc.logger.Warnw("Viper failed to read user config", "error", err)
-
-		// if the error is yaml-format-related, show a sensible error. otherwise, show 'em to the logs
-		if strings.Contains(err.Error(), "yaml:") {
-			cc.notifier.Notify("Invalid configuration!",
-				fmt.Sprintf("Please make sure %s is in a valid YAML format.", userConfigFilepath))
-		} else {
-			cc.notifier.Notify("Error loading configuration!", "Please check deej's logs for more details.")
-		}
-
-		return fmt.Errorf("read user config: %w", err)
+		return cc.handleConfigError("user config", err)
 	}
-
-	// load the internal config - this doesn't have to exist, so it can error
-	if err := cc.internalConfig.ReadInConfig(); err != nil {
-		cc.logger.Debugw("Viper failed to read internal config", "error", err, "reminder", "this is fine")
-	}
-
-	// canonize the configuration with viper's helpers
-	if err := cc.populateFromVipers(); err != nil {
-		cc.logger.Warnw("Failed to populate config fields", "error", err)
-		return fmt.Errorf("populate config fields: %w", err)
-	}
-
-	cc.logger.Info("Loaded config successfully")
-	cc.logger.Infow("Config values",
-		"sliderMapping", cc.SliderMapping,
-		"connectionInfo", cc.ConnectionInfo,
-		"invertSliders", cc.InvertSliders)
-
 	return nil
 }
 
-// SubscribeToChanges allows external components to receive updates when the config is reloaded
-func (cc *CanonicalConfig) SubscribeToChanges() chan bool {
-	c := make(chan bool)
-	cc.reloadConsumers = append(cc.reloadConsumers, c)
-
-	return c
+// handleMissingConfig notifies the user of missing configuration
+func (cc *CanonicalConfig) handleMissingConfig() {
+	cc.logger.Warnw("Configuration file not found", "path", userConfigFilepath)
+	cc.notifier.Notify("Missing configuration!", fmt.Sprintf(
+		"Ensure %s exists in the same directory as deej.", userConfigFilepath))
 }
 
-// WatchConfigFileChanges starts watching for configuration file changes
-// and attempts reloading the config when they happen
-func (cc *CanonicalConfig) WatchConfigFileChanges() {
-	cc.logger.Debugw("Starting to watch user config file for changes", "path", userConfigFilepath)
+// handleConfigError processes errors during config file loading
+func (cc *CanonicalConfig) handleConfigError(configName string, err error) error {
+	cc.logger.Warnw("Failed to load configuration", "config", configName, "error", err)
 
-	const (
-		minTimeBetweenReloadAttempts = time.Millisecond * 500
-		delayBetweenEventAndReload   = time.Millisecond * 50
-	)
-
-	lastAttemptedReload := time.Now()
-
-	// establish watch using viper as opposed to doing it ourselves, though our internal cooldown is still required
-	cc.userConfig.WatchConfig()
-	cc.userConfig.OnConfigChange(func(event fsnotify.Event) {
-
-		// when we get a write event...
-		if event.Op&fsnotify.Write == fsnotify.Write {
-
-			now := time.Now()
-
-			// ... check if it's not a duplicate (many editors will write to a file twice)
-			if lastAttemptedReload.Add(minTimeBetweenReloadAttempts).Before(now) {
-
-				// and attempt reload if appropriate
-				cc.logger.Debugw("Config file modified, attempting reload", "event", event)
-
-				// wait a bit to let the editor actually flush the new file contents to disk
-				<-time.After(delayBetweenEventAndReload)
-
-				if err := cc.Load(); err != nil {
-					cc.logger.Warnw("Failed to reload config file", "error", err)
-				} else {
-					cc.logger.Info("Reloaded config successfully")
-					cc.notifier.Notify("Configuration reloaded!", "Your changes have been applied.")
-
-					cc.onConfigReloaded()
-				}
-
-				// don't forget to update the time
-				lastAttemptedReload = now
-			}
-		}
-	})
-
-	// wait till they stop us
-	<-cc.stopWatcherChannel
-	cc.logger.Debug("Stopping user config file watcher")
-	cc.userConfig.OnConfigChange(nil)
+	if strings.Contains(err.Error(), "yaml:") {
+		cc.notifier.Notify("Invalid configuration format!",
+			"Ensure the YAML file is properly formatted.")
+	} else {
+		cc.notifier.Notify("Error loading configuration!", "Check logs for more details.")
+	}
+	return fmt.Errorf("read %s: %w", configName, err)
 }
 
-// StopWatchingConfigFile signals our filesystem watcher to stop
-func (cc *CanonicalConfig) StopWatchingConfigFile() {
-	cc.stopWatcherChannel <- true
-}
-
+// populateFromVipers reads configuration fields into structured fields
 func (cc *CanonicalConfig) populateFromVipers() error {
-
-	// merge the slider mappings from the user and internal configs
 	cc.SliderMapping = sliderMapFromConfigs(
 		cc.userConfig.GetStringMapStringSlice(configKeySliderMapping),
 		cc.internalConfig.GetStringMapStringSlice(configKeySliderMapping),
 	)
-
-	// get the rest of the config fields - viper saves us a lot of effort here
-	cc.ConnectionInfo.COMPort = cc.userConfig.GetString(configKeyCOMPort)
-
-	cc.ConnectionInfo.BaudRate = cc.userConfig.GetInt(configKeyBaudRate)
-	if cc.ConnectionInfo.BaudRate <= 0 {
-		cc.logger.Warnw("Invalid baud rate specified, using default value",
-			"key", configKeyBaudRate,
-			"invalidValue", cc.ConnectionInfo.BaudRate,
-			"defaultValue", defaultBaudRate)
-
-		cc.ConnectionInfo.BaudRate = defaultBaudRate
+	cc.ConnectionInfo = ConnectionInfo{
+		COMPort:  cc.userConfig.GetString(configKeyCOMPort),
+		BaudRate: cc.validateBaudRate(cc.userConfig.GetInt(configKeyBaudRate)),
 	}
-
 	cc.InvertSliders = cc.userConfig.GetBool(configKeyInvertSliders)
-	cc.NoiseReductionLevel = cc.userConfig.GetString(configKeyNoiseReductionLevel)
+	cc.NoiseReductionLevel = cc.userConfig.GetString(configKeyNoiseReduction)
 
-	cc.logger.Debug("Populated config fields from vipers")
-
+	cc.logger.Debugw("Configuration populated successfully", "config", cc)
 	return nil
 }
 
-func (cc *CanonicalConfig) onConfigReloaded() {
-	cc.logger.Debug("Notifying consumers about configuration reload")
-
-	for _, consumer := range cc.reloadConsumers {
-		consumer <- true
+// validateBaudRate checks for a valid baud rate, returning a default if invalid
+func (cc *CanonicalConfig) validateBaudRate(baudRate int) int {
+	if baudRate > 0 {
+		return baudRate
 	}
+	cc.logger.Warnw("Invalid baud rate specified, using default", "invalidValue", baudRate, "defaultValue", defaultBaudRate)
+	return defaultBaudRate
 }

@@ -11,54 +11,53 @@ import (
 )
 
 const (
-	buildTypeNone    = ""
-	buildTypeDev     = "dev"
-	buildTypeRelease = "release"
+	BuildTypeNone    = ""       // Default build type (undefined)
+	BuildTypeDev     = "dev"    // Development build type
+	BuildTypeRelease = "release" // Release build type
 
-	logDirectory = "logs"
-	logFilename  = "deej-latest-run.log"
+	LogDirectory = "logs"                 // Directory for log files
+	LogFilename  = "deej-latest-run.log"  // Default log file name
 )
 
-// NewLogger provides a logger instance for the whole program
+// NewLogger initializes and returns a new logger instance based on the build type.
+// - For release builds, logs to a file with info level and above.
+// - For development builds, logs to stderr with debug level and colorful output.
 func NewLogger(buildType string) (*zap.SugaredLogger, error) {
 	var loggerConfig zap.Config
 
-	// release: info and above, log to file only (no UI)
-	if buildType == buildTypeRelease {
-		if err := util.EnsureDirExists(logDirectory); err != nil {
-			return nil, fmt.Errorf("ensure log directory exists: %w", err)
+	// Configure for release builds: logs to file, "info" level and above
+	if buildType == BuildTypeRelease {
+		// Ensure the log directory exists
+		if err := util.EnsureDirExists(LogDirectory); err != nil {
+			return nil, fmt.Errorf("failed to create log directory %s: %w", LogDirectory, err)
 		}
 
+		// Set production configuration
 		loggerConfig = zap.NewProductionConfig()
-
-		loggerConfig.OutputPaths = []string{filepath.Join(logDirectory, logFilename)}
+		loggerConfig.OutputPaths = []string{filepath.Join(LogDirectory, LogFilename)}
 		loggerConfig.Encoding = "console"
 
-		// development: debug and above, log to stderr only, colorful
 	} else {
+		// Configure for development builds: logs to stderr, "debug" level and colorful output
 		loggerConfig = zap.NewDevelopmentConfig()
-
-		// make it colorful
 		loggerConfig.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
 	}
 
-	// all build types: make it readable
-	loggerConfig.EncoderConfig.EncodeCaller = nil
+	// Common encoder settings: human-readable timestamps and aligned names
+	loggerConfig.EncoderConfig.EncodeCaller = nil // Disable caller encoding
 	loggerConfig.EncoderConfig.EncodeTime = func(t time.Time, enc zapcore.PrimitiveArrayEncoder) {
 		enc.AppendString(t.Format("2006-01-02 15:04:05.000"))
 	}
-
-	loggerConfig.EncoderConfig.EncodeName = func(s string, enc zapcore.PrimitiveArrayEncoder) {
-		enc.AppendString(fmt.Sprintf("%-27s", s))
+	loggerConfig.EncoderConfig.EncodeName = func(name string, enc zapcore.PrimitiveArrayEncoder) {
+		enc.AppendString(fmt.Sprintf("%-27s", name))
 	}
 
+	// Build the logger
 	logger, err := loggerConfig.Build()
 	if err != nil {
-		return nil, fmt.Errorf("create zap logger: %w", err)
+		return nil, fmt.Errorf("failed to create logger: %w", err)
 	}
 
-	// no reason not to use the sugared logger - it's fast enough for anything we're gonna do
-	sugar := logger.Sugar()
-
-	return sugar, nil
+	// Return the sugared logger for ease of use
+	return logger.Sugar(), nil
 }
