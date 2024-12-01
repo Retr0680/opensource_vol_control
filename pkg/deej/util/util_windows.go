@@ -11,86 +11,82 @@ import (
 )
 
 const (
+	// Cooldown duration to avoid frequent calls to GetCurrentWindowProcessNames.
 	getCurrentWindowInternalCooldown = time.Millisecond * 350
 )
 
 var (
+	// Cache the result and the last call timestamp to avoid frequent API calls.
 	lastGetCurrentWindowResult []string
 	lastGetCurrentWindowCall   = time.Now()
 )
 
+// getCurrentWindowProcessNames retrieves the process names of the currently focused window and its child windows
+// (if applicable), considering UWP apps and processes running in container apps (e.g., Steam, League Client).
 func getCurrentWindowProcessNames() ([]string, error) {
-
-	// apply an internal cooldown on this function to avoid calling windows API functions too frequently.
-	// return a cached value during that cooldown
+	// Apply an internal cooldown to avoid excessive API calls.
 	now := time.Now()
 	if lastGetCurrentWindowCall.Add(getCurrentWindowInternalCooldown).After(now) {
+		// Return cached results during cooldown period
 		return lastGetCurrentWindowResult, nil
 	}
 
 	lastGetCurrentWindowCall = now
 
-	// the logic of this implementation is a bit convoluted because of the way UWP apps
-	// (also known as "modern win 10 apps" or "microsoft store apps") work.
-	// these are rendered in a parent container by the name of ApplicationFrameHost.exe.
-	// when windows's GetForegroundWindow is called, it returns the window owned by that parent process.
-	// so whenever we get that, we need to go and look through its child windows until we find one with a different PID.
-	// this behavior is most common with UWP, but it actually applies to any "container" process:
-	// an acceptable approach is to return a slice of possible process names that could be the "right" one, looking
-	// them up is fairly cheap and covers the most bases for apps that hide their audio-playing inside another process
-	// (like steam, and the league client, and any UWP app)
+	// Initialize the result slice to store process names
+	var result []string
 
-	result := []string{}
-
-	// a callback that will be called for each child window of the foreground window, if it has any
+	// Callback function for enumerating child windows of the foreground window.
 	enumChildWindowsCallback := func(childHWND *uintptr, lParam *uintptr) uintptr {
-
-		// cast the outer lp into something we can work with (maybe closures are good enough?)
+		// Cast lParam to get the owner PID (parent process PID)
 		ownerPID := (*uint32)(unsafe.Pointer(lParam))
 
-		// get the child window's real PID
+		// Get the child window's real PID
 		var childPID uint32
 		win.GetWindowThreadProcessId((win.HWND)(unsafe.Pointer(childHWND)), &childPID)
 
-		// compare it to the parent's - if they're different, add the child window's process to our list of process names
+		// If child PID is different from owner PID, add the child's process name to the result list
 		if childPID != *ownerPID {
-
-			// warning: this can silently fail, needs to be tested more thoroughly and possibly reverted in the future
-			actualProcess, err := ps.FindProcess(int(childPID))
-			if err == nil {
-				result = append(result, actualProcess.Executable())
+			processName, err := getProcessNameByPID(childPID)
+			if err != nil {
+				return 1 // Continue enumerating child windows
 			}
+			result = append(result, processName)
 		}
 
-		// indicates to the system to keep iterating
-		return 1
+		return 1 // Continue enumerating child windows
 	}
 
-	// get the current foreground window
+	// Get the current foreground window and its owner (parent) PID
 	hwnd := win.GetForegroundWindow()
 	var ownerPID uint32
-
-	// get its PID and put it in our window info struct
 	win.GetWindowThreadProcessId(hwnd, &ownerPID)
 
-	// check for system PID (0)
+	// If the parent process PID is 0 (system PID), return an empty result
 	if ownerPID == 0 {
 		return nil, nil
 	}
 
-	// find the process name corresponding to the parent PID
-	process, err := ps.FindProcess(int(ownerPID))
+	// Find the process name of the parent window and add it to the result
+	processName, err := getProcessNameByPID(ownerPID)
 	if err != nil {
-		return nil, fmt.Errorf("get parent process for pid %d: %w", ownerPID, err)
+		return nil, fmt.Errorf("failed to get parent process for PID %d: %w", ownerPID, err)
 	}
+	result = append(result, processName)
 
-	// add it to our result slice
-	result = append(result, process.Executable())
-
-	// iterate its child windows, adding their names too
+	// Enumerate child windows and add their process names if they differ from the parent
 	win.EnumChildWindows(hwnd, syscall.NewCallback(enumChildWindowsCallback), (uintptr)(unsafe.Pointer(&ownerPID)))
 
-	// cache & return whichever executable names we ended up with
+	// Cache the result for future use
 	lastGetCurrentWindowResult = result
 	return result, nil
+}
+
+// getProcessNameByPID retrieves the process name of the process corresponding to the provided PID.
+func getProcessNameByPID(pid uint32) (string, error) {
+	process, err := ps.FindProcess(int(pid))
+	if err != nil {
+		return "", fmt.Errorf("failed to find process for PID %d: %w", pid, err)
+	}
+	return process.Executable(), nil
 }
