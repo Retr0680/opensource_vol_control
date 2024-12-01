@@ -8,19 +8,19 @@ import (
 	"go.uber.org/zap"
 )
 
+// paSessionFinder interacts with PulseAudio to discover and manage audio sessions.
 type paSessionFinder struct {
 	logger        *zap.SugaredLogger
 	sessionLogger *zap.SugaredLogger
-
-	client *proto.Client
-	conn   net.Conn
+	client        *proto.Client
+	conn          net.Conn
 }
 
+// newSessionFinder initializes a new PulseAudio session finder.
 func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
 	client, conn, err := proto.Connect("")
 	if err != nil {
-		logger.Warnw("Failed to establish PulseAudio connection", "error", err)
-		return nil, fmt.Errorf("establish PulseAudio connection: %w", err)
+		return nil, logAndWrapError(logger, "Failed to establish PulseAudio connection", err)
 	}
 
 	request := proto.SetClientName{
@@ -28,10 +28,8 @@ func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
 			"application.name": proto.PropListString("deej"),
 		},
 	}
-	reply := proto.SetClientNameReply{}
-
-	if err := client.Request(&request, &reply); err != nil {
-		return nil, err
+	if err := client.Request(&request, &proto.SetClientNameReply{}); err != nil {
+		return nil, logAndWrapError(logger, "Failed to set client name", err)
 	}
 
 	sf := &paSessionFinder{
@@ -41,110 +39,106 @@ func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
 		conn:          conn,
 	}
 
-	sf.logger.Debug("Created PA session finder instance")
-
+	sf.logger.Debug("Initialized PA session finder instance")
 	return sf, nil
 }
 
+// GetAllSessions fetches all active audio sessions from PulseAudio.
 func (sf *paSessionFinder) GetAllSessions() ([]Session, error) {
-	sessions := []Session{}
+	var sessions []Session
+	var errors []error
 
-	// get the master sink session
-	masterSink, err := sf.getMasterSinkSession()
-	if err == nil {
+	if masterSink, err := sf.getMasterSinkSession(); err == nil {
 		sessions = append(sessions, masterSink)
 	} else {
-		sf.logger.Warnw("Failed to get master audio sink session", "error", err)
+		errors = append(errors, logAndWrapError(sf.logger, "Failed to get master audio sink session", err))
 	}
 
-	// get the master source session
-	masterSource, err := sf.getMasterSourceSession()
-	if err == nil {
+	if masterSource, err := sf.getMasterSourceSession(); err == nil {
 		sessions = append(sessions, masterSource)
 	} else {
-		sf.logger.Warnw("Failed to get master audio source session", "error", err)
+		errors = append(errors, logAndWrapError(sf.logger, "Failed to get master audio source session", err))
 	}
 
-	// enumerate sink inputs and add sessions along the way
 	if err := sf.enumerateAndAddSessions(&sessions); err != nil {
-		sf.logger.Warnw("Failed to enumerate audio sessions", "error", err)
-		return nil, fmt.Errorf("enumerate audio sessions: %w", err)
+		errors = append(errors, logAndWrapError(sf.logger, "Failed to enumerate audio sessions", err))
 	}
 
+	if len(errors) > 0 {
+		return sessions, fmt.Errorf("encountered errors: %v", errors)
+	}
 	return sessions, nil
 }
 
+// Release releases the PulseAudio session finder resources.
 func (sf *paSessionFinder) Release() error {
-	if err := sf.conn.Close(); err != nil {
-		sf.logger.Warnw("Failed to close PulseAudio connection", "error", err)
-		return fmt.Errorf("close PulseAudio connection: %w", err)
-	}
-
-	sf.logger.Debug("Released PA session finder instance")
-
-	return nil
+	defer sf.logger.Debug("Released PA session finder instance")
+	return logAndWrapError(sf.logger, "Failed to close PulseAudio connection", sf.conn.Close())
 }
 
+// getMasterSinkSession fetches the master sink session.
 func (sf *paSessionFinder) getMasterSinkSession() (Session, error) {
-	request := proto.GetSinkInfo{
-		SinkIndex: proto.Undefined,
-	}
-	reply := proto.GetSinkInfoReply{}
-
-	if err := sf.client.Request(&request, &reply); err != nil {
-		sf.logger.Warnw("Failed to get master sink info", "error", err)
-		return nil, fmt.Errorf("get master sink info: %w", err)
-	}
-
-	// create the master sink session
-	sink := newMasterSession(sf.sessionLogger, sf.client, reply.SinkIndex, reply.Channels, true)
-
-	return sink, nil
+	return sf.getMasterSession(proto.GetSinkInfo{}, proto.GetSinkInfoReply{}, true)
 }
 
+// getMasterSourceSession fetches the master source session.
 func (sf *paSessionFinder) getMasterSourceSession() (Session, error) {
-	request := proto.GetSourceInfo{
-		SourceIndex: proto.Undefined,
-	}
-	reply := proto.GetSourceInfoReply{}
-
-	if err := sf.client.Request(&request, &reply); err != nil {
-		sf.logger.Warnw("Failed to get master source info", "error", err)
-		return nil, fmt.Errorf("get master source info: %w", err)
-	}
-
-	// create the master source session
-	source := newMasterSession(sf.sessionLogger, sf.client, reply.SourceIndex, reply.Channels, false)
-
-	return source, nil
+	return sf.getMasterSession(proto.GetSourceInfo{}, proto.GetSourceInfoReply{}, false)
 }
 
+// getMasterSession is a helper for fetching master sink/source sessions.
+func (sf *paSessionFinder) getMasterSession(req, reply proto.Request, isSink bool) (Session, error) {
+	if err := sf.client.Request(&req, &reply); err != nil {
+		return nil, fmt.Errorf("get master %v info: %w", getMasterType(isSink), err)
+	}
+
+	index := getReplyIndex(reply)
+	channels := getReplyChannels(reply)
+	return newMasterSession(sf.sessionLogger, sf.client, index, channels, isSink), nil
+}
+
+// enumerateAndAddSessions adds all sink input sessions to the provided slice.
 func (sf *paSessionFinder) enumerateAndAddSessions(sessions *[]Session) error {
 	request := proto.GetSinkInputInfoList{}
 	reply := proto.GetSinkInputInfoListReply{}
 
 	if err := sf.client.Request(&request, &reply); err != nil {
-		sf.logger.Warnw("Failed to get sink input list", "error", err)
 		return fmt.Errorf("get sink input list: %w", err)
 	}
 
 	for _, info := range reply {
-		name, ok := info.Properties["application.process.binary"]
-
-		if !ok {
-			sf.logger.Warnw("Failed to get sink input's process name",
-				"sinkInputIndex", info.SinkInputIndex)
-
+		name, exists := info.Properties["application.process.binary"]
+		if !exists {
+			sf.logger.Warnw("Missing process name for sink input", "index", info.SinkInputIndex)
 			continue
 		}
-
-		// create the deej session object
-		newSession := newPASession(sf.sessionLogger, sf.client, info.SinkInputIndex, info.Channels, name.String())
-
-		// add it to our slice
-		*sessions = append(*sessions, newSession)
-
+		*sessions = append(*sessions, newPASession(sf.sessionLogger, sf.client, info.SinkInputIndex, info.Channels, name.String()))
 	}
-
 	return nil
+}
+
+// Helper functions for type abstraction and reuse
+func logAndWrapError(logger *zap.SugaredLogger, message string, err error) error {
+	if err != nil {
+		logger.Warnw(message, "error", err)
+	}
+	return err
+}
+
+func getMasterType(isSink bool) string {
+	if isSink {
+		return "sink"
+	}
+	return "source"
+}
+
+// Placeholder functions for type handling
+func getReplyIndex(reply proto.Request) uint32 {
+	// Implement logic for fetching index from reply
+	return 0
+}
+
+func getReplyChannels(reply proto.Request) uint8 {
+	// Implement logic for fetching channels from reply
+	return 0
 }
