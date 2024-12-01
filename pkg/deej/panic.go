@@ -3,7 +3,6 @@ package deej
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -15,8 +14,7 @@ import (
 const (
 	crashlogFilename        = "deej-crash-%s.log"
 	crashlogTimestampFormat = "2006.01.02-15.04.05"
-
-	crashMessage = `-----------------------------------------------------------------
+	crashMessageTemplate    = `-----------------------------------------------------------------
                         deej crashlog
 -----------------------------------------------------------------
 Unfortunately, deej has crashed. This really shouldn't happen!
@@ -31,38 +29,52 @@ Stack trace:
 `
 )
 
+// recoverFromPanic handles application panics, logs the error, and attempts to shut down gracefully.
 func (d *Deej) recoverFromPanic() {
-	r := recover()
-
-	if r == nil {
-		return
+	if r := recover(); r != nil {
+		d.handlePanic(r)
 	}
+}
 
-	// if we got here, we're recovering from a panic!
+// handlePanic logs the panic details, writes a crash log file, and notifies the user.
+func (d *Deej) handlePanic(recoverValue interface{}) {
 	now := time.Now()
-
-	// that would suck
-	if err := util.EnsureDirExists(logDirectory); err != nil {
-		panic(fmt.Errorf("ensure crashlog dir exists: %w", err))
-	}
-
-	crashlogBytes := bytes.NewBufferString(fmt.Sprintf(crashMessage, now.Format(crashlogTimestampFormat), r, debug.Stack()))
 	crashlogPath := filepath.Join(logDirectory, fmt.Sprintf(crashlogFilename, now.Format(crashlogTimestampFormat)))
 
-	// that would REALLY suck
-	if err := ioutil.WriteFile(crashlogPath, crashlogBytes.Bytes(), os.ModePerm); err != nil {
-		panic(fmt.Errorf("can't even write the crashlog file contents: %w", err))
+	// Create the crash log content.
+	crashLogContent := d.createCrashLogContent(now, recoverValue)
+
+	// Ensure the log directory exists.
+	if err := util.EnsureDirExists(logDirectory); err != nil {
+		panic(fmt.Errorf("failed to create log directory: %w", err))
 	}
 
-	d.logger.Errorw("Encountered and logged panic, crashing",
+	// Write the crash log file.
+	if err := os.WriteFile(crashlogPath, crashLogContent, 0644); err != nil {
+		panic(fmt.Errorf("failed to write crash log: %w", err))
+	}
+
+	// Log and notify the crash.
+	d.logger.Errorw("Application panic encountered",
 		"crashlogPath", crashlogPath,
-		"error", r)
+		"error", recoverValue)
 
-	d.notifier.Notify("Unexpected crash occurred...",
-		fmt.Sprintf("More details in %s", crashlogPath))
+	d.notifier.Notify("Unexpected crash occurred",
+		fmt.Sprintf("Details logged to: %s", crashlogPath))
 
-	// bye :(
+	// Attempt to shut down gracefully.
 	d.signalStop()
-	d.logger.Errorw("Quitting", "exitCode", 1)
+
+	// Exit with an error code.
+	d.logger.Errorw("Exiting due to panic", "exitCode", 1)
 	os.Exit(1)
+}
+
+// createCrashLogContent generates the formatted crash log content.
+func (d *Deej) createCrashLogContent(timestamp time.Time, recoverValue interface{}) []byte {
+	return []byte(fmt.Sprintf(crashMessageTemplate,
+		timestamp.Format(crashlogTimestampFormat),
+		recoverValue,
+		debug.Stack(),
+	))
 }
